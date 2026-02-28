@@ -104,7 +104,7 @@ from math import atan2, degrees
 VISIBILITY_THRESHOLD = 0.5
 STRAIGHT_LIMB_MARGIN = 20
 EXTENDED_LIMB_MARGIN = 0.8
-SNAP_TOLERANCE = 15
+SNAP_TOLERANCE = 10
 GESTURE_CONFIRMATION_FRAMES = 5
 ANGLE_SNAP_STEP = 45
 
@@ -405,9 +405,12 @@ def output_gesture(key, frame, send_keypress, log_file, caps_active, hold_mode):
 # Black canvas (np.zeros) — black background reads as "nothing" against a dark
 # game like Minecraft. The Minecraft paper-doll and HUD are drawn on top.
 # Press ESC in the overlay window to quit.
-OVERLAY_W = 300              # overlay window width  — resize to taste
-OVERLAY_H = 500              # overlay window height — resize to taste
+OVERLAY_W = 400              # overlay window width  — resize to taste
+OVERLAY_H = 550              # overlay window height — resize to taste
 OVERLAY_WIN = "Semaphore Overlay"
+
+# EMA smoothing factor: 0.0 = frozen, 1.0 = no smoothing. 0.35 feels fluid.
+EMA_ALPHA = 0.35
 
 # ── Minecraft-palette colours (BGR for OpenCV) ────────────────────────────────
 MC_SKIN = (120, 160, 198)   # face / hands
@@ -417,12 +420,18 @@ MC_SHIRT_D = (140,  75,  40)   # darker shirt outline
 MC_TROUSER = (160,  50,  50)   # trousers
 MC_TROUSER_D = (120,  35,  35)   # darker trouser outline
 MC_BOOT = (20,  50,  80)   # boots
+MC_NECK = (110, 145, 180)   # neck (slightly darker than skin)
 MC_OUTLINE = (30,  30,  30)   # near-black outline
 
 # ── HUD colours (BGR) ─────────────────────────────────────────────────────────
 HUD_COLOR = (0, 220, 255)   # yellow
 CONFIRM_COLOR = (120, 255,   0)   # green
 WARN_COLOR = (60, 100, 255)   # orange
+
+# ── EMA smoothed landmark positions ──────────────────────────────────────────
+# Stored as a flat dict {idx: np.array([x, y])} in normalised 0-1 space.
+# Updated every frame by _smooth_landmarks().
+_ema_lm = {}
 
 
 # ── GEOMETRY ──────────────────────────────────────────────────────────────────
@@ -441,14 +450,9 @@ def _rotated_rect_pts(cx, cy, w, h, angle_deg):
 def _draw_block(canvas, fill_bgr, outline_bgr, cx, cy, w, h, angle_deg):
     """Draw one filled + outlined rotated rectangle onto canvas."""
     pts = _rotated_rect_pts(cx, cy, w, h, angle_deg).reshape((-1, 1, 2))
-    cv2.fillPoly(canvas, [pts], fill_bgr)
-    cv2.polylines(canvas, [pts], isClosed=True, color=outline_bgr, thickness=2)
-
-
-def _lm(landmarks, idx):
-    """Landmark -> (x, y) pixel coords in the overlay window, X mirrored."""
-    lm = landmarks[idx]
-    return (int((1 - lm.x) * OVERLAY_W), int(lm.y * OVERLAY_H))
+    cv2.fillPoly(canvas,   [pts], fill_bgr)
+    cv2.polylines(canvas,  [pts], isClosed=True,
+                  color=outline_bgr, thickness=2)
 
 
 def _angle_deg(p1, p2):
@@ -461,98 +465,189 @@ def _mid(p1, p2):
     return ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2)
 
 
+# ── EMA SMOOTHING ─────────────────────────────────────────────────────────────
+
+def _smooth_landmarks(landmarks):
+    """
+    Apply exponential moving average to all landmark positions.
+    Operates in normalised (0-1) space before pixel conversion so the
+    smoothing is resolution-independent.
+    Returns a dict {idx: (smooth_x, smooth_y)} in normalised coords.
+    """
+    global _ema_lm
+    IDXS = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
+    for i in IDXS:
+        lm = landmarks[i]
+        raw = np.array([1 - lm.x, lm.y])   # X mirrored to match body[]
+        if i not in _ema_lm:
+            _ema_lm[i] = raw.copy()
+        else:
+            _ema_lm[i] = EMA_ALPHA * raw + (1 - EMA_ALPHA) * _ema_lm[i]
+    return _ema_lm
+
+
+def _to_px(smooth, idx, ox, oy, scale):
+    """
+    Convert a smoothed normalised landmark to pixel coords on the canvas,
+    anchored at (ox, oy) with the given pixel-per-unit scale.
+    """
+    nx, ny = smooth[idx]
+    return (int(ox + nx * scale), int(oy + ny * scale))
+
+
 # ── MINECRAFT PAPER DOLL ──────────────────────────────────────────────────────
 
 def _draw_minecraft_character(canvas, landmarks):
     """
-    Draw a blocky Minecraft-style 2D paper doll driven by live landmarks.
-    Body parts are rotated rectangles whose angles come from the real joints.
-    Draw order: right side (back) -> torso -> head -> left side (front).
+    Draw a Minecraft paper doll with four improvements over the naive version:
+
+    1. ANCHORED — the character is positioned based on the actual bounding box
+       of the body landmarks, so it sits exactly where you are in frame and
+       moves with you rather than always filling the whole window.
+
+    2. SMOOTHED — landmark positions are EMA-filtered each frame to eliminate
+       the jitter from raw MediaPipe output, giving fluid, stable movement.
+
+    3. PROPORTIONED — all block sizes derive from a single 'unit' measurement
+       (half the shoulder-to-hip distance), keeping the character correctly
+       proportioned at any distance from the camera.
+
+    4. NECK — a small neck block bridges the gap between torso top and head
+       bottom so the character looks connected.
+
+    Draw order: right limbs (back) → torso → neck → head → left limbs (front).
     """
     if not landmarks:
         return
 
-    lsh = _lm(landmarks, 11)
-    rsh = _lm(landmarks, 12)
-    lel = _lm(landmarks, 13)
-    rel = _lm(landmarks, 14)
-    lwr = _lm(landmarks, 15)
-    rwr = _lm(landmarks, 16)
-    lhip = _lm(landmarks, 23)
-    rhip = _lm(landmarks, 24)
-    lkn = _lm(landmarks, 25)
-    rkn = _lm(landmarks, 26)
-    lank = _lm(landmarks, 27)
-    rank = _lm(landmarks, 28)
+    smooth = _smooth_landmarks(landmarks)
 
-    sh_mid = _mid(lsh,  rsh)
+    # ── 1. ANCHOR: find bounding box of body landmarks in normalised space ────
+    # Use only the core body landmarks (shoulders, hips) for the anchor so
+    # that wildly extended arms don't shift the character around.
+    anchor_idxs = [11, 12, 23, 24]
+    xs = [smooth[i][0] for i in anchor_idxs]
+    ys = [smooth[i][1] for i in anchor_idxs]
+    body_cx_n = (min(xs) + max(xs)) / 2.0   # normalised body centre X
+    body_cy_n = (min(ys) + max(ys)) / 2.0   # normalised body centre Y
+
+    # Map body centre to canvas centre
+    canvas_cx = OVERLAY_W / 2.0
+    canvas_cy = OVERLAY_H / 2.0
+
+    # ── 2. SCALE from shoulder-to-hip distance ────────────────────────────────
+    # 'unit' = half shoulder-to-hip distance in normalised coords.
+    # All block widths / heights are multiples of this unit.
+    sh_mid_n = (smooth[11] + smooth[12]) / 2.0
+    hip_mid_n = (smooth[23] + smooth[24]) / 2.0
+    torso_len_n = np.linalg.norm(sh_mid_n - hip_mid_n)
+    unit_n = max(torso_len_n / 2.0, 0.04)   # guard against zero
+
+    # Desired torso height on canvas = 30% of overlay height
+    target_torso_px = OVERLAY_H * 0.30
+    scale = target_torso_px / (torso_len_n + 1e-6)   # px per normalised unit
+
+    # Anchor offset: translate normalised coords so body centre maps to canvas centre
+    ox = canvas_cx - body_cx_n * scale
+    oy = canvas_cy - body_cy_n * scale
+
+    def px(idx):
+        return _to_px(smooth, idx, ox, oy, scale)
+
+    # ── 3. PROPORTIONED block sizes (multiples of unit in pixels) ─────────────
+    u = unit_n * scale   # 1 unit in pixels
+
+    HW = int(u * 1.4)
+    HH = int(u * 1.4)   # head  (square)
+    NW = int(u * 0.5)
+    NH = int(u * 0.5)   # neck
+    TW = int(u * 1.6)
+    TH = int(u * 2.1)   # torso
+    UAW = int(u * 0.6)
+    UAH = int(u * 1.1)   # upper arm
+    FAW = int(u * 0.55)
+    FAH = int(u * 1.05)  # forearm
+    TWW = int(u * 0.65)
+    TWH = int(u * 1.15)  # thigh
+    SHW = int(u * 0.6)
+    SHH = int(u * 1.1)   # shin
+    BTH = int(u * 0.35)                        # boot height
+
+    # Resolve pixel positions for all joints
+    lsh = px(11)
+    rsh = px(12)
+    lel = px(13)
+    rel = px(14)
+    lwr = px(15)
+    rwr = px(16)
+    lhip = px(23)
+    rhip = px(24)
+    lkn = px(25)
+    rkn = px(26)
+    lank = px(27)
+    rank = px(28)
+
+    sh_mid = _mid(lsh, rsh)
     hip_mid = _mid(lhip, rhip)
 
-    # Scale block sizes to shoulder width so they adapt to camera distance
-    sw = max(abs(lsh[0] - rsh[0]), 20)
-    sc = sw / 60.0
-
-    def blk(w, h):
-        return int(w * sc), int(h * sc)
-
-    HW,  HH = blk(50, 50)   # head
-    TW,  TH = blk(54, 72)   # torso
-    UAW, UAH = blk(20, 38)   # upper arm
-    FAW, FAH = blk(18, 36)   # forearm
-    TWW, TWH = blk(22, 40)   # thigh
-    SHW, SHH = blk(20, 38)   # shin
-    BTH = int(12 * sc)  # boot height
-
-    # ── Right leg (back) ─────────────────────────────────────────────────────
+    # ── Draw: right side (back) ───────────────────────────────────────────────
     ang = _angle_deg(rhip, rkn)
     _draw_block(canvas, MC_TROUSER, MC_TROUSER_D,
                 *_mid(rhip, rkn), TWW, TWH, ang)
     ang = _angle_deg(rkn, rank)
     _draw_block(canvas, MC_TROUSER, MC_TROUSER_D,
                 *_mid(rkn, rank), SHW, SHH, ang)
-    _draw_block(canvas, MC_BOOT, MC_OUTLINE, *rank, SHW, BTH, ang)
+    _draw_block(canvas, MC_BOOT,    MC_OUTLINE,
+                *rank,            SHW, BTH, ang)
 
-    # ── Right arm (back) ─────────────────────────────────────────────────────
     ang = _angle_deg(rsh, rel)
-    _draw_block(canvas, MC_SHIRT, MC_SHIRT_D, *_mid(rsh, rel), UAW, UAH, ang)
+    _draw_block(canvas, MC_SHIRT,  MC_SHIRT_D, *_mid(rsh, rel), UAW, UAH, ang)
     ang = _angle_deg(rel, rwr)
-    _draw_block(canvas, MC_SKIN, MC_SHIRT_D, *_mid(rel, rwr), FAW, FAH, ang)
+    _draw_block(canvas, MC_SKIN,   MC_SHIRT_D, *_mid(rel, rwr), FAW, FAH, ang)
 
     # ── Torso ─────────────────────────────────────────────────────────────────
     ang = _angle_deg(sh_mid, hip_mid)
     _draw_block(canvas, MC_SHIRT, MC_SHIRT_D, *
                 _mid(sh_mid, hip_mid), TW, TH, ang)
 
+    # ── 4. NECK — bridges torso top to head bottom ────────────────────────────
+    # Position: one neck-height above shoulder midpoint, along torso direction
+    torso_ang_rad = np.radians(ang)
+    neck_cx = int(sh_mid[0] - np.sin(torso_ang_rad) * NH * 0.5)
+    neck_cy = int(sh_mid[1] - np.cos(torso_ang_rad) * NH * 0.5)
+    _draw_block(canvas, MC_NECK, MC_OUTLINE, neck_cx, neck_cy, NW, NH, ang)
+
     # ── Head ──────────────────────────────────────────────────────────────────
-    hx = sh_mid[0]
-    hy = sh_mid[1] - int(HH * 0.65)
-    _draw_block(canvas, MC_SKIN, MC_OUTLINE, hx, hy, HW, HH, 0)
+    # Centre the head above the neck
+    hx = int(sh_mid[0] - np.sin(torso_ang_rad) * (NH + HH * 0.5))
+    hy = int(sh_mid[1] - np.cos(torso_ang_rad) * (NH + HH * 0.5))
+    _draw_block(canvas, MC_SKIN,  MC_OUTLINE, hx, hy, HW, HH, 0)
     hair_h = int(HH * 0.35)
     hair_cy = hy - HH // 2 + hair_h // 2
     _draw_block(canvas, MC_HAIR, MC_OUTLINE, hx, hair_cy, HW, hair_h, 0)
     eye_y = hy - int(HH * 0.08)
     eye_off = int(HW * 0.18)
-    eye_sz = max(int(HW * 0.14), 3)
+    eye_sz = max(int(HW * 0.13), 2)
     for ex in [hx - eye_off, hx + eye_off]:
         cv2.rectangle(canvas,
                       (ex - eye_sz // 2, eye_y - eye_sz // 2),
                       (ex + eye_sz // 2, eye_y + eye_sz // 2),
                       (80, 30, 30), -1)
 
-    # ── Left leg (front) ─────────────────────────────────────────────────────
+    # ── Left side (front) ─────────────────────────────────────────────────────
     ang = _angle_deg(lhip, lkn)
     _draw_block(canvas, MC_TROUSER, MC_TROUSER_D,
                 *_mid(lhip, lkn), TWW, TWH, ang)
     ang = _angle_deg(lkn, lank)
     _draw_block(canvas, MC_TROUSER, MC_TROUSER_D,
                 *_mid(lkn, lank), SHW, SHH, ang)
-    _draw_block(canvas, MC_BOOT, MC_OUTLINE, *lank, SHW, BTH, ang)
+    _draw_block(canvas, MC_BOOT,    MC_OUTLINE,
+                *lank,            SHW, BTH, ang)
 
-    # ── Left arm (front) ─────────────────────────────────────────────────────
     ang = _angle_deg(lsh, lel)
     _draw_block(canvas, MC_SHIRT, MC_SHIRT_D, *_mid(lsh, lel), UAW, UAH, ang)
     ang = _angle_deg(lel, lwr)
-    _draw_block(canvas, MC_SKIN, MC_SHIRT_D, *_mid(lel, lwr), FAW, FAH, ang)
+    _draw_block(canvas, MC_SKIN,  MC_SHIRT_D, *_mid(lel, lwr), FAW, FAH, ang)
 
 
 # ── DRAW OVERLAY ──────────────────────────────────────────────────────────────
