@@ -95,53 +95,69 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import time
+import json
+import socket
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from scipy.spatial import distance as dist
 from math import atan2, degrees
 
 # ── TUNING THRESHOLDS ─────────────────────────────────────────────────────────
-VISIBILITY_THRESHOLD = 0.5
+VISIBILITY_THRESHOLD = 0.5   # Min landmark confidence to be considered visible
+# Max degrees of bend for a "straight" arm (degrees)
 STRAIGHT_LIMB_MARGIN = 20
-EXTENDED_LIMB_MARGIN = 0.8
-SNAP_TOLERANCE = 10
+EXTENDED_LIMB_MARGIN = 0.8   # Forearm must be >= this fraction of upper-arm length
+# Max per-arm angular error for semaphore snapping (degrees)
+SNAP_TOLERANCE = 15
+# Consecutive frames required to confirm a gesture
 GESTURE_CONFIRMATION_FRAMES = 5
-ANGLE_SNAP_STEP = 45
+ANGLE_SNAP_STEP = 45    # Angle grid size — keep at 45 to match semaphore table
 
 # ── JUMP DETECTION ────────────────────────────────────────────────────────────
+# Hip rise (normalised 0–1) above baseline to count as a jump
 JUMP_THRESHOLD = 0.06
+# Frames of hip history used to compute the standing baseline
 JUMP_BASELINE_FRAMES = 20
+# Frames to suppress further jumps after one fires (~1 s at 30 fps)
 JUMP_COOLDOWN_FRAMES = 30
 
 # ── BOW DETECTION ─────────────────────────────────────────────────────────────
+# Torso-height shrinkage (normalised 0–1) required to count as a bow
 BOW_THRESHOLD = 0.08
-BOW_BASELINE_FRAMES = 20
+BOW_BASELINE_FRAMES = 20     # Frames of torso-height history for the upright baseline
+# Frames to suppress re-triggering after a bow fires (~1.3 s at 30 fps)
 BOW_COOLDOWN_FRAMES = 40
 
 # ── HOLD / SPAM MODE ──────────────────────────────────────────────────────────
-SPAM_RATE = 10
+SPAM_RATE = 10    # Key presses per second — only used for keys listed in TAP_REPEAT_KEYS
+# Consecutive frames of no gesture before hold/spam stops.
 SPAM_DEBOUNCE_FRAMES = 8
+# Prevents a single wobbly frame from interrupting the hold.
 
-# Keys tapped repeatedly rather than truly held down.
+# Keys that should be tapped repeatedly rather than truly held down.
+# Everything else (w, a, s, d, space, arrow keys, etc.) will be held with
+# keyboard.press() and released with keyboard.release() for smooth movement.
 TAP_REPEAT_KEYS = {"escape", "tab", "enter", "backspace", "capslock"}
 
 # ── OUTPUT ────────────────────────────────────────────────────────────────────
-OUTPUT_FILE = "semaphore_output.txt"
+OUTPUT_FILE = "semaphore_output.txt"   # Set to None to disable file logging
 
 # ── CAMERA / MODEL ────────────────────────────────────────────────────────────
 MODEL_PATH = 'pose_landmarker_heavy.task'
 CAMERA_INDEX = 0
 
-# ── SKELETON CONNECTIONS ──────────────────────────────────────────────────────
+# ── SKELETON CONNECTIONS (landmark index pairs) ───────────────────────────────
 POSE_CONNECTIONS = [
-    (11, 12), (11, 13), (13, 15),
-    (12, 14), (14, 16),
-    (11, 23), (12, 24), (23, 24),
-    (23, 25), (25, 27),
-    (24, 26), (26, 28),
+    (11, 12), (11, 13), (13, 15),   # Left arm
+    (12, 14), (14, 16),             # Right arm
+    (11, 23), (12, 24), (23, 24),   # Torso
+    (23, 25), (25, 27),             # Left leg
+    (24, 26), (26, 28),             # Right leg
 ]
 
 # ── SEMAPHORE LOOKUP TABLE ────────────────────────────────────────────────────
+# Keys are (left_arm_angle, right_arm_angle) in degrees, snapped to 45° grid.
+# 'a' = alphabetic output, 'n' = numeric/symbol output (when number-shift active).
 SEMAPHORES = {
     (-90, -45): {'a': "a",       'n': "1"},
     (-90,   0): {'a': "b",       'n': "2"},
@@ -174,43 +190,38 @@ SEMAPHORES = {
     (225,  45): {'a': "escape"},
 }
 
-# ── STATE ─────────────────────────────────────────────────────────────────────
-gesture_buffer = []
-last_confirmed_gesture = None
-caps_lock_active = False
+# ── GESTURE CONFIRMATION STATE ────────────────────────────────────────────────
+gesture_buffer = []    # Rolling list of detected gesture labels
+last_confirmed_gesture = None  # Prevents the same gesture firing twice in a row
+
+# ── CAPS LOCK / JUMP STATE ────────────────────────────────────────────────────
+caps_lock_active = False         # Whether caps lock is currently on
+# Rolling buffer of recent hip Y positions (flipped coords)
 hip_y_history = []
-jump_cooldown = 0
-hold_mode_active = False
-spam_key = None
-last_spam_time = 0.0
+jump_cooldown = 0             # Counts down after a jump fires to prevent re-triggering
+
+# ── HOLD MODE / BOW STATE ─────────────────────────────────────────────────────
+hold_mode_active = False   # False = tap mode (one press per gesture confirm)
+# True  = hold mode (key held down while pose is held)
+spam_key = None    # The key currently being held/spammed, or None if idle
+last_spam_time = 0.0     # time.time() of last tap-repeat press (TAP_REPEAT_KEYS only)
+# Counts consecutive frames with no detected gesture.
 spam_debounce_counter = 0
+# Only releases the key once this hits SPAM_DEBOUNCE_FRAMES,
+# so a single wobbly frame doesn't interrupt a held key.
+# Rolling buffer of shoulder-to-hip distances for bow detection
 torso_height_history = []
-bow_cooldown = 0
+bow_cooldown = 0       # Counts down after a bow fires to prevent re-triggering
 
-
-# ── DRAWING HELPER: semi-transparent filled rect ──────────────────────────────
-
-def _fill_rect_alpha(image, x1, y1, x2, y2, color_bgr, alpha=0.45):
-    """
-    Blend a filled rectangle onto `image` in-place.
-    alpha=0.0 → invisible, alpha=1.0 → fully opaque.
-    Clamps coordinates to valid image bounds automatically.
-    """
-    x1 = max(0, x1)
-    y1 = max(0, y1)
-    x2 = min(image.shape[1], x2)
-    y2 = min(image.shape[0], y2)
-    if x2 <= x1 or y2 <= y1:
-        return
-    roi = image[y1:y2, x1:x2]
-    overlay = roi.copy()
-    cv2.rectangle(overlay, (0, 0), (x2 - x1, y2 - y1), color_bgr, -1)
-    cv2.addWeighted(overlay, alpha, roi, 1.0 - alpha, 0, roi)
-
+MC_IP = "127.0.0.1"
+MC_PORT = 5005
+udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 # ── GEOMETRY HELPERS ──────────────────────────────────────────────────────────
 
+
 def get_angle(a, b, c):
+    """Return the angle (degrees) at joint b, formed by points a–b–c."""
     ang = degrees(
         atan2(c['y'] - b['y'], c['x'] - b['x']) -
         atan2(a['y'] - b['y'], a['x'] - b['x'])
@@ -219,22 +230,39 @@ def get_angle(a, b, c):
 
 
 def get_limb_direction(arm):
+    """
+    Return the arm's direction snapped to the nearest ANGLE_SNAP_STEP grid.
+    arm is a 3-tuple: (shoulder, elbow, wrist) landmark dicts.
+    Returns an integer angle; 270° is remapped to -90° for consistency.
+    """
     dy = arm[2]['y'] - arm[0]['y']
     dx = arm[2]['x'] - arm[0]['x']
     angle = degrees(atan2(dy, dx))
+
+    # Snap to nearest grid step
     mod_close = angle % ANGLE_SNAP_STEP
     angle -= mod_close
     if mod_close > ANGLE_SNAP_STEP / 2:
         angle += ANGLE_SNAP_STEP
+
     angle = int(angle)
     return -90 if angle == 270 else angle
 
 
 def is_limb_pointing(upper, mid, lower):
+    """
+    Return True if the limb (upper→mid→lower) is:
+      - all landmarks sufficiently visible,
+      - roughly straight (within STRAIGHT_LIMB_MARGIN degrees), and
+      - forearm at least EXTENDED_LIMB_MARGIN × upper-arm length.
+    """
     if any(j['visibility'] < VISIBILITY_THRESHOLD for j in [upper, mid, lower]):
         return False
-    if abs(180 - get_angle(upper, mid, lower)) >= STRAIGHT_LIMB_MARGIN:
+
+    straightness = abs(180 - get_angle(upper, mid, lower))
+    if straightness >= STRAIGHT_LIMB_MARGIN:
         return False
+
     u_len = dist.euclidean([upper['x'], upper['y']], [mid['x'], mid['y']])
     l_len = dist.euclidean([lower['x'], lower['y']], [mid['x'], mid['y']])
     return l_len >= EXTENDED_LIMB_MARGIN * u_len
@@ -243,129 +271,212 @@ def is_limb_pointing(upper, mid, lower):
 # ── JUMP DETECTION ────────────────────────────────────────────────────────────
 
 def detect_jump(body):
+    """
+    Track hip Y over time and return True when the performer jumps.
+
+    Coordinate note: body dicts use flipped Y (1 - lm.y), so:
+      y = 1.0  → top of frame (highest position)
+      y = 0.0  → bottom of frame (lowest position)
+    A jump therefore shows as hip_y INCREASING above the rolling baseline.
+
+    Returns True once per jump (gated by JUMP_COOLDOWN_FRAMES).
+    """
     global hip_y_history, jump_cooldown
+
+    # Tick down cooldown every frame regardless
     if jump_cooldown > 0:
         jump_cooldown -= 1
-    hipL, hipR = body[23], body[24]
-    if hipL['visibility'] < VISIBILITY_THRESHOLD or hipR['visibility'] < VISIBILITY_THRESHOLD:
+
+    hipL = body[23]
+    hipR = body[24]
+
+    # Only use hip positions when both are confidently visible
+    if (hipL['visibility'] < VISIBILITY_THRESHOLD or
+            hipR['visibility'] < VISIBILITY_THRESHOLD):
         return False
+
     current_hip_y = (hipL['y'] + hipR['y']) / 2.0
     hip_y_history.append(current_hip_y)
+
+    # Keep buffer to JUMP_BASELINE_FRAMES length
     if len(hip_y_history) > JUMP_BASELINE_FRAMES:
         hip_y_history.pop(0)
+
+    # Need a full baseline window before we can reliably detect jumps
     if len(hip_y_history) < JUMP_BASELINE_FRAMES:
         return False
+
+    # Baseline = average of the older frames (exclude the newest 3 which may
+    # already be mid-jump)
     baseline = sum(hip_y_history[:-3]) / len(hip_y_history[:-3])
+
     if current_hip_y > baseline + JUMP_THRESHOLD and jump_cooldown == 0:
         jump_cooldown = JUMP_COOLDOWN_FRAMES
         return True
+
     return False
 
 
 # ── BOW DETECTION ─────────────────────────────────────────────────────────────
 
 def detect_bow(body):
+    """
+    Detect a bow pose by tracking the vertical distance between shoulders and hips.
+
+    Coordinate note: body dicts use flipped Y (1 - lm.y), so:
+      y = 1.0  → top of frame    y = 0.0  → bottom of frame
+    When standing upright, shoulders sit well above hips:
+      torso_height = avg_shoulder_y - avg_hip_y  →  positive value
+    When bowing forward, shoulders drop toward hips:
+      torso_height SHRINKS below the rolling baseline.
+
+    Returns True once per bow (gated by BOW_COOLDOWN_FRAMES).
+    """
     global torso_height_history, bow_cooldown
+
     if bow_cooldown > 0:
         bow_cooldown -= 1
+
     shoulderL, shoulderR = body[11], body[12]
     hipL,      hipR = body[23], body[24]
-    if any(lm['visibility'] < VISIBILITY_THRESHOLD for lm in [shoulderL, shoulderR, hipL, hipR]):
+
+    landmarks = [shoulderL, shoulderR, hipL, hipR]
+    if any(lm['visibility'] < VISIBILITY_THRESHOLD for lm in landmarks):
         return False
-    current_torso_height = ((shoulderL['y'] + shoulderR['y']) / 2.0 -
-                            (hipL['y'] + hipR['y']) / 2.0)
+
+    avg_shoulder_y = (shoulderL['y'] + shoulderR['y']) / 2.0
+    avg_hip_y = (hipL['y'] + hipR['y']) / 2.0
+    current_torso_height = avg_shoulder_y - avg_hip_y
+
     torso_height_history.append(current_torso_height)
     if len(torso_height_history) > BOW_BASELINE_FRAMES:
         torso_height_history.pop(0)
+
     if len(torso_height_history) < BOW_BASELINE_FRAMES:
         return False
+
+    # Baseline from older frames; exclude newest 3 which may already be mid-bow
     baseline = sum(torso_height_history[:-3]) / len(torso_height_history[:-3])
+
     if current_torso_height < baseline - BOW_THRESHOLD and bow_cooldown == 0:
         bow_cooldown = BOW_COOLDOWN_FRAMES
         return True
+
     return False
 
 
-# ── SEMAPHORE MATCHING ────────────────────────────────────────────────────────
-
 def snap_to_nearest_semaphore(detected_l_ang, detected_r_ang, tolerance=None):
+    """
+    Find the closest entry in SEMAPHORES to (detected_l_ang, detected_r_ang).
+
+    Uses SNAP_TOLERANCE (or the override passed in) as the maximum allowed
+    error *per arm* — i.e. total distance budget is tolerance * 2.
+
+    Returns (snapped_l_ang, snapped_r_ang, semaphore_dict)
+         or (None, None, None) if nothing is close enough.
+    """
     if tolerance is None:
         tolerance = SNAP_TOLERANCE
-    best_match, best_distance = None, float('inf')
+
+    best_match = None
+    best_distance = float('inf')
+
     for (l_ang, r_ang), semaphore in SEMAPHORES.items():
+        # Angular distance with wrap-around handling
         l_diff = min(abs(detected_l_ang - l_ang),
                      360 - abs(detected_l_ang - l_ang))
         r_diff = min(abs(detected_r_ang - r_ang),
                      360 - abs(detected_r_ang - r_ang))
         total = l_diff + r_diff
+
         if total < best_distance and total <= tolerance * 2:
             best_distance = total
             best_match = (l_ang, r_ang)
+
     if best_match:
         return best_match[0], best_match[1], SEMAPHORES[best_match]
+
     return None, None, None
 
 
 # ── GESTURE CONFIRMATION ──────────────────────────────────────────────────────
 
 def check_gesture_confirmation(detected_gesture):
+    """
+    Accumulate detected_gesture into gesture_buffer.
+    Returns the gesture label once GESTURE_CONFIRMATION_FRAMES consecutive
+    identical frames are seen (and only when it differs from the last output).
+    Returns None otherwise.
+    """
     global gesture_buffer, last_confirmed_gesture
+
     if detected_gesture is None:
         gesture_buffer = []
         return None
+
+    # Reset buffer on gesture change
     if gesture_buffer and gesture_buffer[-1] != detected_gesture:
         gesture_buffer = []
+
     gesture_buffer.append(detected_gesture)
+
     if len(gesture_buffer) >= GESTURE_CONFIRMATION_FRAMES:
         if detected_gesture != last_confirmed_gesture:
             last_confirmed_gesture = detected_gesture
             gesture_buffer = []
             return detected_gesture
+
     return None
 
 
-# ── KEY HELPERS ───────────────────────────────────────────────────────────────
+# ── KEY PRESS / HOLD / RELEASE HELPERS ───────────────────────────────────────
 
 def _resolve_key(key, caps_active):
+    """Return the (keyboard_arg, display_string) pair for a key + caps state."""
     if caps_active and len(key) == 1 and key.isalpha():
         return f"shift+{key}", key.upper()
     return key, key
 
 
 def _press_key(kb_key, send_keypress):
+    """Hold a key down (keyboard.press). Used for movement / sustained input."""
     if send_keypress:
         import keyboard
         keyboard.press(kb_key)
 
 
 def _release_key(kb_key, send_keypress):
+    """Release a previously held key (keyboard.release)."""
     if send_keypress:
         import keyboard
         keyboard.release(kb_key)
 
 
 def fire_keypress(kb_key, send_keypress):
+    """
+    Send a single press_and_release for kb_key.
+    Used by tap mode and for keys listed in TAP_REPEAT_KEYS in hold mode.
+    """
     if send_keypress:
         import keyboard
         keyboard.press_and_release(kb_key)
 
 
-def release_held_key(send_keypress):
-    global spam_key, spam_debounce_counter, last_confirmed_gesture
-    if spam_key is not None:
-        if spam_key not in TAP_REPEAT_KEYS:
-            _release_key(spam_key, send_keypress)
-            print(f"  ✋ Released held key '{spam_key}'")
-        else:
-            print(f"  ✋ Stopped tap-repeat of '{spam_key}'")
-        spam_key = None
-    spam_debounce_counter = 0
-    last_confirmed_gesture = None
-
-
 # ── OUTPUT ────────────────────────────────────────────────────────────────────
 
 def output_gesture(key, frame, send_keypress, log_file, caps_active, hold_mode):
+    """
+    Handle a newly confirmed gesture.
+
+    TAP MODE  (hold_mode=False):
+        Fire a single press_and_release right now. Done.
+
+    HOLD MODE (hold_mode=True):
+        For keys in TAP_REPEAT_KEYS  → store in spam_key for rapid tap-repeat.
+        For all other keys (w/a/s/d, space, etc.) → call keyboard.press() to
+        physically hold the key down. The main loop calls keyboard.release()
+        once the pose is lost. This is what Minecraft needs for smooth movement.
+    """
     global spam_key, last_spam_time
     from datetime import datetime
 
@@ -380,13 +491,19 @@ def output_gesture(key, frame, send_keypress, log_file, caps_active, hold_mode):
 
     if hold_mode:
         if kb_key in TAP_REPEAT_KEYS:
+            # Tap-repeat mode for special keys: store and let the spam ticker fire
             if spam_key != kb_key:
+                # Release any previously held key before switching
                 if spam_key is not None:
                     _release_key(spam_key, send_keypress)
+                    print(
+                        f"  → Released '{spam_key}' (switching to tap-repeat '{kb_key}')")
                 spam_key = kb_key
-                last_spam_time = 0.0
+                last_spam_time = 0.0   # Fire immediately on the very next tick
                 print(f"  → Tap-repeat key set to '{kb_key}'")
         else:
+            # True hold: physically press the key down and keep it held.
+            # If the key has changed, release the old one first.
             if spam_key != kb_key:
                 if spam_key is not None:
                     _release_key(spam_key, send_keypress)
@@ -394,336 +511,168 @@ def output_gesture(key, frame, send_keypress, log_file, caps_active, hold_mode):
                 spam_key = kb_key
                 _press_key(kb_key, send_keypress)
                 print(f"  → Holding '{kb_key}' down")
+            # If it's the same key already held, do nothing — it's already down.
     else:
+        # Tap mode: one clean press_and_release, nothing stored
         fire_keypress(kb_key, send_keypress)
         if not send_keypress:
+            # Display-only: draw the key on the frame as visual feedback
             cv2.putText(frame, display_key, (50, 100),
                         cv2.FONT_HERSHEY_SIMPLEX, 3, (0, 0, 255), 5)
 
 
-# ── OVERLAY WINDOW ────────────────────────────────────────────────────────────
-# Black canvas (np.zeros) — black background reads as "nothing" against a dark
-# game like Minecraft. The Minecraft paper-doll and HUD are drawn on top.
-# Press ESC in the overlay window to quit.
-OVERLAY_W = 400              # overlay window width  — resize to taste
-OVERLAY_H = 550              # overlay window height — resize to taste
-OVERLAY_WIN = "Semaphore Overlay"
-
-# EMA smoothing factor: 0.0 = frozen, 1.0 = no smoothing. 0.35 feels fluid.
-EMA_ALPHA = 0.35
-
-# ── Minecraft-palette colours (BGR for OpenCV) ────────────────────────────────
-MC_SKIN = (120, 160, 198)   # face / hands
-MC_HAIR = (30,  60,  90)   # hair
-MC_SHIRT = (180, 100,  55)   # torso / upper arms (blue shirt)
-MC_SHIRT_D = (140,  75,  40)   # darker shirt outline
-MC_TROUSER = (160,  50,  50)   # trousers
-MC_TROUSER_D = (120,  35,  35)   # darker trouser outline
-MC_BOOT = (20,  50,  80)   # boots
-MC_NECK = (110, 145, 180)   # neck (slightly darker than skin)
-MC_OUTLINE = (30,  30,  30)   # near-black outline
-
-# ── HUD colours (BGR) ─────────────────────────────────────────────────────────
-HUD_COLOR = (0, 220, 255)   # yellow
-CONFIRM_COLOR = (120, 255,   0)   # green
-WARN_COLOR = (60, 100, 255)   # orange
-
-# ── EMA smoothed landmark positions ──────────────────────────────────────────
-# Stored as a flat dict {idx: np.array([x, y])} in normalised 0-1 space.
-# Updated every frame by _smooth_landmarks().
-_ema_lm = {}
-
-
-# ── GEOMETRY ──────────────────────────────────────────────────────────────────
-
-def _rotated_rect_pts(cx, cy, w, h, angle_deg):
-    """Return the 4 corners of a rotated rectangle as an int32 numpy array."""
-    rad = np.radians(angle_deg)
-    c, s = np.cos(rad), np.sin(rad)
-    hw, hh = w / 2.0, h / 2.0
-    corners = np.array([[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]])
-    rot = np.array([[c, -s], [s, c]])
-    rotated = (rot @ corners.T).T + np.array([cx, cy])
-    return rotated.astype(np.int32)
-
-
-def _draw_block(canvas, fill_bgr, outline_bgr, cx, cy, w, h, angle_deg):
-    """Draw one filled + outlined rotated rectangle onto canvas."""
-    pts = _rotated_rect_pts(cx, cy, w, h, angle_deg).reshape((-1, 1, 2))
-    cv2.fillPoly(canvas,   [pts], fill_bgr)
-    cv2.polylines(canvas,  [pts], isClosed=True,
-                  color=outline_bgr, thickness=2)
-
-
-def _angle_deg(p1, p2):
-    """Clockwise angle from straight-down of the vector p1 -> p2."""
-    dx, dy = p2[0] - p1[0], p2[1] - p1[1]
-    return degrees(np.arctan2(dx, dy))
-
-
-def _mid(p1, p2):
-    return ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2)
-
-
-# ── EMA SMOOTHING ─────────────────────────────────────────────────────────────
-
-def _smooth_landmarks(landmarks):
+def release_held_key(send_keypress):
     """
-    Apply exponential moving average to all landmark positions.
-    Operates in normalised (0-1) space before pixel conversion so the
-    smoothing is resolution-independent.
-    Returns a dict {idx: (smooth_x, smooth_y)} in normalised coords.
+    Release whatever key is currently held (spam_key) and clear state.
+    Called when the pose is lost in hold mode, or when switching back to tap mode.
     """
-    global _ema_lm
-    IDXS = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
-    for i in IDXS:
-        lm = landmarks[i]
-        raw = np.array([1 - lm.x, lm.y])   # X mirrored to match body[]
-        if i not in _ema_lm:
-            _ema_lm[i] = raw.copy()
+    global spam_key, spam_debounce_counter, last_confirmed_gesture
+    if spam_key is not None:
+        if spam_key not in TAP_REPEAT_KEYS:
+            # Only truly held keys need an explicit release
+            _release_key(spam_key, send_keypress)
+            print(f"  ✋ Released held key '{spam_key}'")
         else:
-            _ema_lm[i] = EMA_ALPHA * raw + (1 - EMA_ALPHA) * _ema_lm[i]
-    return _ema_lm
+            print(f"  ✋ Stopped tap-repeat of '{spam_key}'")
+        spam_key = None
+    spam_debounce_counter = 0
+    # Reset so the same gesture can re-trigger immediately after re-posing
+    last_confirmed_gesture = None
 
 
-def _to_px(smooth, idx, ox, oy, scale):
+def send_to_minecraft(landmarks, gesture, is_holding, is_caps):
     """
-    Convert a smoothed normalised landmark to pixel coords on the canvas,
-    anchored at (ox, oy) with the given pixel-per-unit scale.
+    Formats 13 specific landmarks + gesture state into JSON and sends via UDP.
     """
-    nx, ny = smooth[idx]
-    return (int(ox + nx * scale), int(oy + ny * scale))
+    # 1. Map MediaPipe indices to the 13 nodes expected by your Java mod
+    # MediaPipe Indices: 0=nose, 2=L_eye, 5=R_eye, 7=L_ear, 8=R_ear,
+    # 11=L_shoud, 12=R_shoud, 13=L_elb, 14=R_elb, 15=L_wrist, 16=R_wrist, 23=L_hip, 24=R_hip
+    target_indices = [0, 2, 5, 7, 8, 11, 12, 13, 14, 15, 16, 23, 24]
+
+    nodes = []
+    for idx in target_indices:
+        lm = landmarks[idx]
+        # Convert normalized (0-1) to "Camera Pixels" to match mock_server style
+        nodes.append([lm.x * 1920, lm.y * 1080])
+
+    # 2. Build the full payload
+    payload = {
+        "nodes": nodes,
+        "gesture": str(gesture) if gesture else "None",
+        "holding": bool(is_holding),
+        "caps": bool(is_caps)
+    }
+
+    # 3. Ship it
+    try:
+        udp_sock.sendto(json.dumps(payload).encode("utf-8"), (MC_IP, MC_PORT))
+    except Exception as e:
+        print(f"Socket error: {e}")
 
 
-# ── MINECRAFT PAPER DOLL ──────────────────────────────────────────────────────
+# ── DRAWING ───────────────────────────────────────────────────────────────────
 
-def _draw_minecraft_character(canvas, landmarks):
-    """
-    Draw a Minecraft paper doll with four improvements over the naive version:
+def draw_skeleton(image, pose_landmarks):
+    """Draw landmark dots and bone lines onto image (in-place)."""
+    h, w, _ = image.shape
 
-    1. ANCHORED — the character is positioned based on the actual bounding box
-       of the body landmarks, so it sits exactly where you are in frame and
-       moves with you rather than always filling the whole window.
+    for lm in pose_landmarks:
+        cx, cy = int(lm.x * w), int(lm.y * h)
+        cv2.circle(image, (cx, cy), 5, (0, 255, 0), -1)
 
-    2. SMOOTHED — landmark positions are EMA-filtered each frame to eliminate
-       the jitter from raw MediaPipe output, giving fluid, stable movement.
-
-    3. PROPORTIONED — all block sizes derive from a single 'unit' measurement
-       (half the shoulder-to-hip distance), keeping the character correctly
-       proportioned at any distance from the camera.
-
-    4. NECK — a small neck block bridges the gap between torso top and head
-       bottom so the character looks connected.
-
-    Draw order: right limbs (back) → torso → neck → head → left limbs (front).
-    """
-    if not landmarks:
-        return
-
-    smooth = _smooth_landmarks(landmarks)
-
-    # ── 1. ANCHOR: find bounding box of body landmarks in normalised space ────
-    # Use only the core body landmarks (shoulders, hips) for the anchor so
-    # that wildly extended arms don't shift the character around.
-    anchor_idxs = [11, 12, 23, 24]
-    xs = [smooth[i][0] for i in anchor_idxs]
-    ys = [smooth[i][1] for i in anchor_idxs]
-    body_cx_n = (min(xs) + max(xs)) / 2.0   # normalised body centre X
-    body_cy_n = (min(ys) + max(ys)) / 2.0   # normalised body centre Y
-
-    # Map body centre to canvas centre
-    canvas_cx = OVERLAY_W / 2.0
-    canvas_cy = OVERLAY_H / 2.0
-
-    # ── 2. SCALE from shoulder-to-hip distance ────────────────────────────────
-    # 'unit' = half shoulder-to-hip distance in normalised coords.
-    # All block widths / heights are multiples of this unit.
-    sh_mid_n = (smooth[11] + smooth[12]) / 2.0
-    hip_mid_n = (smooth[23] + smooth[24]) / 2.0
-    torso_len_n = np.linalg.norm(sh_mid_n - hip_mid_n)
-    unit_n = max(torso_len_n / 2.0, 0.04)   # guard against zero
-
-    # Desired torso height on canvas = 30% of overlay height
-    target_torso_px = OVERLAY_H * 0.30
-    scale = target_torso_px / (torso_len_n + 1e-6)   # px per normalised unit
-
-    # Anchor offset: translate normalised coords so body centre maps to canvas centre
-    ox = canvas_cx - body_cx_n * scale
-    oy = canvas_cy - body_cy_n * scale
-
-    def px(idx):
-        return _to_px(smooth, idx, ox, oy, scale)
-
-    # ── 3. PROPORTIONED block sizes (multiples of unit in pixels) ─────────────
-    u = unit_n * scale   # 1 unit in pixels
-
-    HW = int(u * 1.4)
-    HH = int(u * 1.4)   # head  (square)
-    NW = int(u * 0.5)
-    NH = int(u * 0.5)   # neck
-    TW = int(u * 1.6)
-    TH = int(u * 2.1)   # torso
-    UAW = int(u * 0.6)
-    UAH = int(u * 1.1)   # upper arm
-    FAW = int(u * 0.55)
-    FAH = int(u * 1.05)  # forearm
-    TWW = int(u * 0.65)
-    TWH = int(u * 1.15)  # thigh
-    SHW = int(u * 0.6)
-    SHH = int(u * 1.1)   # shin
-    BTH = int(u * 0.35)                        # boot height
-
-    # Resolve pixel positions for all joints
-    lsh = px(11)
-    rsh = px(12)
-    lel = px(13)
-    rel = px(14)
-    lwr = px(15)
-    rwr = px(16)
-    lhip = px(23)
-    rhip = px(24)
-    lkn = px(25)
-    rkn = px(26)
-    lank = px(27)
-    rank = px(28)
-
-    sh_mid = _mid(lsh, rsh)
-    hip_mid = _mid(lhip, rhip)
-
-    # ── Draw: right side (back) ───────────────────────────────────────────────
-    ang = _angle_deg(rhip, rkn)
-    _draw_block(canvas, MC_TROUSER, MC_TROUSER_D,
-                *_mid(rhip, rkn), TWW, TWH, ang)
-    ang = _angle_deg(rkn, rank)
-    _draw_block(canvas, MC_TROUSER, MC_TROUSER_D,
-                *_mid(rkn, rank), SHW, SHH, ang)
-    _draw_block(canvas, MC_BOOT,    MC_OUTLINE,
-                *rank,            SHW, BTH, ang)
-
-    ang = _angle_deg(rsh, rel)
-    _draw_block(canvas, MC_SHIRT,  MC_SHIRT_D, *_mid(rsh, rel), UAW, UAH, ang)
-    ang = _angle_deg(rel, rwr)
-    _draw_block(canvas, MC_SKIN,   MC_SHIRT_D, *_mid(rel, rwr), FAW, FAH, ang)
-
-    # ── Torso ─────────────────────────────────────────────────────────────────
-    ang = _angle_deg(sh_mid, hip_mid)
-    _draw_block(canvas, MC_SHIRT, MC_SHIRT_D, *
-                _mid(sh_mid, hip_mid), TW, TH, ang)
-
-    # ── 4. NECK — bridges torso top to head bottom ────────────────────────────
-    # Position: one neck-height above shoulder midpoint, along torso direction
-    torso_ang_rad = np.radians(ang)
-    neck_cx = int(sh_mid[0] - np.sin(torso_ang_rad) * NH * 0.5)
-    neck_cy = int(sh_mid[1] - np.cos(torso_ang_rad) * NH * 0.5)
-    _draw_block(canvas, MC_NECK, MC_OUTLINE, neck_cx, neck_cy, NW, NH, ang)
-
-    # ── Head ──────────────────────────────────────────────────────────────────
-    # Centre the head above the neck
-    hx = int(sh_mid[0] - np.sin(torso_ang_rad) * (NH + HH * 0.5))
-    hy = int(sh_mid[1] - np.cos(torso_ang_rad) * (NH + HH * 0.5))
-    _draw_block(canvas, MC_SKIN,  MC_OUTLINE, hx, hy, HW, HH, 0)
-    hair_h = int(HH * 0.35)
-    hair_cy = hy - HH // 2 + hair_h // 2
-    _draw_block(canvas, MC_HAIR, MC_OUTLINE, hx, hair_cy, HW, hair_h, 0)
-    eye_y = hy - int(HH * 0.08)
-    eye_off = int(HW * 0.18)
-    eye_sz = max(int(HW * 0.13), 2)
-    for ex in [hx - eye_off, hx + eye_off]:
-        cv2.rectangle(canvas,
-                      (ex - eye_sz // 2, eye_y - eye_sz // 2),
-                      (ex + eye_sz // 2, eye_y + eye_sz // 2),
-                      (80, 30, 30), -1)
-
-    # ── Left side (front) ─────────────────────────────────────────────────────
-    ang = _angle_deg(lhip, lkn)
-    _draw_block(canvas, MC_TROUSER, MC_TROUSER_D,
-                *_mid(lhip, lkn), TWW, TWH, ang)
-    ang = _angle_deg(lkn, lank)
-    _draw_block(canvas, MC_TROUSER, MC_TROUSER_D,
-                *_mid(lkn, lank), SHW, SHH, ang)
-    _draw_block(canvas, MC_BOOT,    MC_OUTLINE,
-                *lank,            SHW, BTH, ang)
-
-    ang = _angle_deg(lsh, lel)
-    _draw_block(canvas, MC_SHIRT, MC_SHIRT_D, *_mid(lsh, lel), UAW, UAH, ang)
-    ang = _angle_deg(lel, lwr)
-    _draw_block(canvas, MC_SKIN,  MC_SHIRT_D, *_mid(lel, lwr), FAW, FAH, ang)
+    for start_idx, end_idx in POSE_CONNECTIONS:
+        s = pose_landmarks[start_idx]
+        e = pose_landmarks[end_idx]
+        cv2.line(image,
+                 (int(s.x * w), int(s.y * h)),
+                 (int(e.x * w), int(e.y * h)),
+                 (255, 255, 255), 2)
 
 
-# ── DRAW OVERLAY ──────────────────────────────────────────────────────────────
+def draw_hud(image, detected_gesture, l_ang, r_ang,
+             snapped_l, snapped_r, buffer_count, confirmed,
+             caps_active, hold_mode, spam_key_name):
+    """Overlay gesture detection info on the camera frame."""
+    h, w, _ = image.shape
 
-def draw_overlay(pose_landmarks, detected_gesture, buffer_count,
-                 confirmed, caps_active, hold_mode, spam_key_name):
-    """
-    Build and show one frame of the black-canvas overlay:
-      - Minecraft paper doll driven by live pose landmarks
-      - HUD: current letter + confirm progress bar
-      - Mode banners stacked at the bottom
-    """
-    canvas = np.zeros((OVERLAY_H, OVERLAY_W, 3), dtype=np.uint8)
+    # ── Top info panel ────────────────────────────────────────────────────────
+    cv2.rectangle(image, (10, 10), (w - 10, 215), (0, 0, 0), -1)
+    cv2.rectangle(image, (10, 10), (w - 10, 215), (255, 255, 255), 2)
 
-    _draw_minecraft_character(canvas, pose_landmarks)
-
-    # ── HUD — top left ────────────────────────────────────────────────────────
-    y = 28
+    y = 50
     if detected_gesture:
-        display = (detected_gesture.upper()
-                   if caps_active and len(detected_gesture) == 1 and detected_gesture.isalpha()
-                   else detected_gesture)
-        color = CONFIRM_COLOR if (hold_mode and spam_key_name) else HUD_COLOR
-        cv2.putText(canvas, display, (12, y + 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.1, (10, 10, 10), 4)
-        cv2.putText(canvas, display, (10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.1, color, 3)
-        y += 36
-
-        bar_w = OVERLAY_W - 20
-        ratio = min(buffer_count / GESTURE_CONFIRMATION_FRAMES, 1.0)
-        done_w = int(bar_w * ratio)
-        bar_col = CONFIRM_COLOR if ratio >= 1.0 else WARN_COLOR
-        cv2.rectangle(canvas, (10, y), (10 + bar_w, y + 8), (50, 50, 50), -1)
-        if done_w > 0:
-            cv2.rectangle(canvas, (10, y), (10 + done_w, y + 8), bar_col, -1)
-        y += 18
-
+        display = detected_gesture.upper() if (caps_active and len(detected_gesture) == 1
+                                               and detected_gesture.isalpha()) else detected_gesture
+        # Yellow-orange tint when actively holding/spamming, normal green otherwise
+        letter_color = (0, 220, 255) if (
+            hold_mode and spam_key_name) else (0, 255, 0)
+        cv2.putText(image, f"Letter: {display}", (30, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 2, letter_color, 3)
+        y += 55
+        cv2.putText(image, f"Raw:     L={l_ang}°  R={r_ang}°", (30, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 0), 2)
+        y += 35
+        cv2.putText(image, f"Snapped: L={snapped_l}°  R={snapped_r}°", (30, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 0), 2)
+        y += 35
+        bar_color = (0, 255, 0) if buffer_count >= GESTURE_CONFIRMATION_FRAMES else (
+            0, 165, 255)
+        cv2.putText(image, f"Confirm: {buffer_count}/{GESTURE_CONFIRMATION_FRAMES}", (30, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, bar_color, 2)
         if confirmed:
-            cv2.putText(canvas, "CONFIRMED!", (10, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, CONFIRM_COLOR, 2)
+            cv2.putText(image, "CONFIRMED!", (w - 280, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
     else:
-        cv2.putText(canvas, "No gesture", (10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 100, 100), 1)
+        cv2.putText(image, "No gesture detected", (30, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (100, 100, 100), 2)
 
-    # ── Mode banners — stack upward from bottom ───────────────────────────────
-    BH = 28
-    by = OVERLAY_H
+    # ── Banners stack upward from the bottom ──────────────────────────────────
+    banner_h = 65
+    banner_y = h
 
+    # ── Caps Lock banner ──────────────────────────────────────────────────────
     if caps_active:
-        by -= BH
-        cv2.rectangle(canvas, (0, by), (OVERLAY_W, by + BH), (150, 70, 0), -1)
-        tw = cv2.getTextSize(
-            "CAPS LOCK ON", cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)[0][0]
-        cv2.putText(canvas, "CAPS LOCK ON",
-                    ((OVERLAY_W - tw) // 2, by + 19),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+        banner_y -= banner_h
+        cv2.rectangle(image, (0, banner_y),
+                      (w, banner_y + banner_h), (0, 130, 255), -1)
+        cv2.rectangle(image, (0, banner_y),
+                      (w, banner_y + banner_h), (0, 80, 180), 3)
+        _draw_banner_text(image, "CAPS LOCK ON", banner_y, banner_h, w)
 
+    # ── Hold mode banner — only shown when hold_mode is active ───────────────
     if hold_mode:
-        by -= BH
+        banner_y -= banner_h
         if spam_key_name:
-            is_tap = spam_key_name in TAP_REPEAT_KEYS
-            kind = "tap" if is_tap else "hold"
-            label = kind + "  '" + spam_key_name + "'"
-            cv2.rectangle(canvas, (0, by), (OVERLAY_W,
-                          by + BH), (35, 100, 0), -1)
+            is_tap_repeat = spam_key_name in TAP_REPEAT_KEYS
+            label = f"HOLD MODE  —  tapping '{spam_key_name}'" if is_tap_repeat \
+                else f"HOLD MODE  —  holding '{spam_key_name}'"
+            # Bright green = actively holding/tapping
+            cv2.rectangle(image, (0, banner_y),
+                          (w, banner_y + banner_h), (0, 170, 60), -1)
+            cv2.rectangle(image, (0, banner_y),
+                          (w, banner_y + banner_h), (0, 90, 30), 3)
+            _draw_banner_text(image, label, banner_y, banner_h, w)
         else:
-            label = "HOLD MODE"
-            cv2.rectangle(canvas, (0, by), (OVERLAY_W,
-                          by + BH), (80, 15, 80), -1)
-        tw = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)[0][0]
-        cv2.putText(canvas, label,
-                    ((OVERLAY_W - tw) // 2, by + 19),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+            # In hold mode but no pose confirmed yet — purple idle
+            cv2.rectangle(image, (0, banner_y),
+                          (w, banner_y + banner_h), (140, 40, 140), -1)
+            cv2.rectangle(image, (0, banner_y),
+                          (w, banner_y + banner_h), (80, 0, 80), 3)
+            _draw_banner_text(image, "HOLD MODE ON", banner_y, banner_h, w)
 
-    cv2.imshow(OVERLAY_WIN, canvas)
+
+def _draw_banner_text(image, label, banner_y, banner_h, w):
+    """Draw centred shadowed text inside a banner rectangle."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 1.4
+    thickness = 3
+    (text_w, text_h), _ = cv2.getTextSize(label, font, font_scale, thickness)
+    text_x = max(10, (w - text_w) // 2)
+    text_y = banner_y + (banner_h + text_h) // 2
+    cv2.putText(image, label, (text_x + 2, text_y + 2),
+                font, font_scale, (0, 0, 0), thickness + 2)
+    cv2.putText(image, label, (text_x,     text_y),     font,
+                font_scale, (255, 255, 255), thickness)
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
@@ -736,36 +685,24 @@ def main():
 
     parser = argparse.ArgumentParser(
         description="Semaphore-to-keyboard converter")
-    parser.add_argument("--type", "-t", action="store_true",
-                        help="Actually send keypresses (default: display-only mode)")
-    parser.add_argument("--tolerance", type=int, default=SNAP_TOLERANCE,
-                        help="Angle snap tolerance in degrees (default: %(default)s)")
+    parser.add_argument('--type', '-t', action='store_true',
+                        help='Actually send keypresses (default: display-only mode)')
+    parser.add_argument('--tolerance', type=int, default=SNAP_TOLERANCE,
+                        help=f'Angle snap tolerance in degrees (default: {SNAP_TOLERANCE})')
     args = parser.parse_args()
 
+    # Open log file if OUTPUT_FILE is set
     log_file = None
     if OUTPUT_FILE:
-        log_file = open(OUTPUT_FILE, "a", encoding="utf-8")
+        log_file = open(OUTPUT_FILE, 'a', encoding='utf-8')
         from datetime import datetime
-        log_file.write("\n=== Session started " +
-                       str(datetime.now()) + " ===\n")
+        log_file.write(f"\n=== Session started {datetime.now()} ===\n")
         log_file.flush()
-        print("Logging confirmed gestures to: " + OUTPUT_FILE)
+        print(f"Logging confirmed gestures to: {OUTPUT_FILE}")
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     cap.set(cv2.CAP_PROP_FPS, 30)
-
-    # Create overlay window; try to make it always-on-top on Windows
-    cv2.namedWindow(OVERLAY_WIN, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(OVERLAY_WIN, OVERLAY_W, OVERLAY_H)
-    try:
-        import ctypes
-        hwnd = ctypes.windll.user32.FindWindowW(None, OVERLAY_WIN)
-        if hwnd:
-            ctypes.windll.user32.SetWindowPos(
-                hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002)
-    except Exception:
-        pass   # Non-Windows: window won't float on top automatically
 
     base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
     options = vision.PoseLandmarkerOptions(
@@ -775,9 +712,10 @@ def main():
 
     with vision.PoseLandmarker.create_from_options(options) as landmarker:
         frame_count = 0
-        pose_landmarks_cache = None
 
         while cap.isOpened():
+            cv2.namedWindow('Semaphore', cv2.WINDOW_NORMAL)
+            cv2.namedWindow('Semaphore', cv2.WND_PROP_TOPMOST, 1)
             success, frame = cap.read()
             if not success:
                 break
@@ -792,97 +730,139 @@ def main():
             l_ang = r_ang = snapped_l = snapped_r = None
 
             if result.pose_landmarks:
-                pose_landmarks_cache = result.pose_landmarks[0]
+                send_to_minecraft(
+                    result.pose_landmarks[0],
+                    detected_gesture,
+                    hold_mode_active,
+                    caps_lock_active
+                )
+
+                draw_skeleton(frame, result.pose_landmarks[0])
+
                 body = [
-                    {"x": 1 - lm.x, "y": 1 - lm.y, "visibility": lm.visibility}
+                    {'x': 1 - lm.x, 'y': 1 - lm.y, 'visibility': lm.visibility}
                     for lm in result.pose_landmarks[0]
                 ]
 
+                # ── Jump → Caps Lock ───────────────────────────────────────
                 if detect_jump(body):
                     caps_lock_active = not caps_lock_active
                     state_label = "ON" if caps_lock_active else "OFF"
-                    print(
-                        "[{}] JUMP - CAPS LOCK {}".format(frame_count, state_label))
+                    print(f"[{frame_count}] 🔼 JUMP — CAPS LOCK {state_label}")
                     if log_file:
                         from datetime import datetime
-                        log_file.write("[{}] [CAPS LOCK {}]\n".format(
-                            datetime.now().strftime("%H:%M:%S"), state_label))
+                        log_file.write(
+                            f"[{datetime.now().strftime('%H:%M:%S')}] [CAPS LOCK {state_label}]\n")
                         log_file.flush()
 
+                # ── Bow → Hold/Tap mode toggle ─────────────────────────────
                 if detect_bow(body):
                     hold_mode_active = not hold_mode_active
                     mode_label = "HOLD" if hold_mode_active else "TAP"
                     print(
-                        "[{}] BOW - switched to {} mode".format(frame_count, mode_label))
+                        f"[{frame_count}] 🙇 BOW — switched to {mode_label} mode")
                     if log_file:
                         from datetime import datetime
-                        log_file.write("[{}] [MODE: {}]\n".format(
-                            datetime.now().strftime("%H:%M:%S"), mode_label))
+                        log_file.write(
+                            f"[{datetime.now().strftime('%H:%M:%S')}] [MODE: {mode_label}]\n")
                         log_file.flush()
+                    # When switching back to tap mode, release any held key immediately
                     if not hold_mode_active:
                         release_held_key(args.type)
 
+                # ── Arm semaphore detection ────────────────────────────────
                 armL = (body[11], body[13], body[15])
                 armR = (body[12], body[14], body[16])
 
                 if is_limb_pointing(*armL) and is_limb_pointing(*armR):
                     l_ang = get_limb_direction(armL)
                     r_ang = get_limb_direction(armR)
+
                     snapped_l, snapped_r, match = snap_to_nearest_semaphore(
-                        l_ang, r_ang, tolerance=args.tolerance)
+                        l_ang, r_ang, tolerance=args.tolerance
+                    )
+
                     if match:
-                        detected_gesture = match["a"]
-                        print("[{}] Gesture: '{}' (L={}->{}  R={}->{})"
-                              " | Buffer: {}/{}".format(
-                                  frame_count, detected_gesture,
-                                  l_ang, snapped_l, r_ang, snapped_r,
-                                  len(gesture_buffer), GESTURE_CONFIRMATION_FRAMES))
+                        detected_gesture = match['a']
+                        print(f"[{frame_count}] Gesture: '{detected_gesture}' "
+                              f"(L={l_ang}°→{snapped_l}°, R={r_ang}°→{snapped_r}°) "
+                              f"| Buffer: {len(gesture_buffer)}/{GESTURE_CONFIRMATION_FRAMES}")
                     else:
-                        print("[{}] No semaphore match - L={}  R={}  (tol={})".format(
-                            frame_count, l_ang, r_ang, args.tolerance))
+                        print(f"[{frame_count}] No semaphore match — "
+                              f"L={l_ang}°, R={r_ang}° (tolerance={args.tolerance}°)")
                 else:
-                    l_vis = all(j["visibility"] >=
+                    l_vis = all(j['visibility'] >=
                                 VISIBILITY_THRESHOLD for j in armL)
-                    r_vis = all(j["visibility"] >=
+                    r_vis = all(j['visibility'] >=
                                 VISIBILITY_THRESHOLD for j in armR)
                     if l_vis and r_vis:
-                        print("[{}] Arms visible but not straight - L={} R={}".format(
-                            frame_count,
-                            is_limb_pointing(*armL),
-                            is_limb_pointing(*armR)))
+                        l_pointing = is_limb_pointing(*armL)
+                        r_pointing = is_limb_pointing(*armR)
+                        print(f"[{frame_count}] Arms visible but not straight — "
+                              f"L_pointing={l_pointing}, R_pointing={r_pointing}")
+
+            # ─────────────────────────────────────────────────────────────────
+            # HOLD MODE LOGIC
+            # ─────────────────────────────────────────────────────────────────
+            # This block runs every frame and has two jobs:
+            #
+            # JOB 1 — Decide whether to keep holding or stop.
+            #   When a gesture is detected we reset the debounce counter so
+            #   the hold keeps going. When the gesture disappears we increment
+            #   the counter. Only once it hits SPAM_DEBOUNCE_FRAMES do we
+            #   actually release the key and stop. This stops a single wobbly
+            #   camera frame from interrupting a sustained hold pose.
+            #
+            # JOB 2 — For TAP_REPEAT_KEYS only: fire the key at SPAM_RATE/s.
+            #   Regular held keys (w/a/s/d etc.) are already physically held
+            #   down by output_gesture — no per-frame action needed for them.
+            # ─────────────────────────────────────────────────────────────────
 
             confirmed = check_gesture_confirmation(detected_gesture)
 
             if hold_mode_active:
+
+                # ── JOB 1: Release key if pose has been absent long enough ───
                 if detected_gesture is not None:
+                    # Pose visible this frame — reset debounce so hold continues
                     spam_debounce_counter = 0
                 else:
                     spam_debounce_counter += 1
                     if spam_debounce_counter >= SPAM_DEBOUNCE_FRAMES:
+                        # Pose truly gone — release the key
                         if spam_key is not None:
                             release_held_key(args.type)
                         spam_debounce_counter = 0
 
+                # ── JOB 2: Tap-repeat for TAP_REPEAT_KEYS ────────────────────
                 if spam_key is not None and spam_key in TAP_REPEAT_KEYS:
                     now = time.time()
-                    if now - last_spam_time >= 1.0 / SPAM_RATE:
+                    spam_interval = 1.0 / SPAM_RATE
+
+                    if now - last_spam_time >= spam_interval:
                         fire_keypress(spam_key, args.type)
                         last_spam_time = now
                         if args.type:
-                            print("  Tap-repeat: '{}'".format(spam_key))
+                            print(f"  💥 Tap-repeat: '{spam_key}'")
+
+            else:
+                # ── TAP MODE: nothing extra — output_gesture handles the press.
+                pass
 
             if confirmed:
-                output_gesture(confirmed, None, args.type, log_file,
+                output_gesture(confirmed, frame, args.type, log_file,
                                caps_lock_active, hold_mode_active)
 
-            draw_overlay(pose_landmarks_cache,
-                         detected_gesture, len(gesture_buffer),
-                         bool(confirmed), caps_lock_active,
-                         hold_mode_active, spam_key)
+            draw_hud(frame, detected_gesture,
+                     l_ang, r_ang, snapped_l, snapped_r,
+                     len(gesture_buffer), bool(confirmed),
+                     caps_lock_active, hold_mode_active, spam_key)
 
+            cv2.imshow('Semaphore', frame)
             if cv2.waitKey(1) & 0xFF == 27:   # ESC to quit
                 break
 
+    # ── Cleanup: make sure no key is left physically held ─────────────────────
     if spam_key is not None:
         release_held_key(args.type)
 
@@ -890,10 +870,10 @@ def main():
     cv2.destroyAllWindows()
     if log_file:
         from datetime import datetime
-        log_file.write("=== Session ended " + str(datetime.now()) + " ===\n")
+        log_file.write(f"=== Session ended {datetime.now()} ===\n")
         log_file.close()
-        print("Log saved to: " + OUTPUT_FILE)
+        print(f"Log saved to: {OUTPUT_FILE}")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
