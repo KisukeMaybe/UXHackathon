@@ -715,7 +715,6 @@ def main():
 
         while cap.isOpened():
             cv2.namedWindow('Semaphore', cv2.WINDOW_NORMAL)
-            cv2.namedWindow('Semaphore', cv2.WND_PROP_TOPMOST, 1)
             success, frame = cap.read()
             if not success:
                 break
