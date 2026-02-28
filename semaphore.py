@@ -64,12 +64,12 @@
 ║                                      a bow fires (~1 s at 30 fps).          ║
 ║                                                                              ║
 ║  SPAM_RATE                 line 61   Key presses per second in spam mode.   ║
-║                                      10 = one press every 100ms. Raise for  ║
-║                                      faster repeat; lower to slow it down.  ║
+║                                      Only used for keys in TAP_REPEAT_KEYS. ║
+║                                      All other keys are held continuously.  ║
 ║                                                                              ║
 ║  SPAM_DEBOUNCE_FRAMES      line 62   Consecutive frames of no detected pose ║
-║                                      before spam stops. Stops a single      ║
-║                                      wobbly frame breaking the spam.        ║
+║                                      before hold stops. Stops a single      ║
+║                                      wobbly frame breaking the hold.        ║
 ║                                                                              ║
 ║  OUTPUT                                                                      ║
 ║  ──────                                                                      ║
@@ -118,10 +118,15 @@ BOW_THRESHOLD       = 0.08   # Torso-height shrinkage (normalised 0–1) require
 BOW_BASELINE_FRAMES = 20     # Frames of torso-height history for the upright baseline
 BOW_COOLDOWN_FRAMES = 40     # Frames to suppress re-triggering after a bow fires (~1.3 s at 30 fps)
 
-# ── SPAM MODE ─────────────────────────────────────────────────────────────────
-SPAM_RATE           = 10     # Key presses per second when in spam/hold mode
-SPAM_DEBOUNCE_FRAMES = 8     # Consecutive frames of no gesture before spam stops.
-                             # Prevents a single wobbly frame from interrupting the spam.
+# ── HOLD / SPAM MODE ──────────────────────────────────────────────────────────
+SPAM_RATE            = 10    # Key presses per second — only used for keys listed in TAP_REPEAT_KEYS
+SPAM_DEBOUNCE_FRAMES = 8     # Consecutive frames of no gesture before hold/spam stops.
+                             # Prevents a single wobbly frame from interrupting the hold.
+
+# Keys that should be tapped repeatedly rather than truly held down.
+# Everything else (w, a, s, d, space, arrow keys, etc.) will be held with
+# keyboard.press() and released with keyboard.release() for smooth movement.
+TAP_REPEAT_KEYS = {"escape", "tab", "enter", "backspace", "capslock"}
 
 # ── OUTPUT ────────────────────────────────────────────────────────────────────
 OUTPUT_FILE = "semaphore_output.txt"   # Set to None to disable file logging
@@ -183,14 +188,14 @@ caps_lock_active = False         # Whether caps lock is currently on
 hip_y_history    = []            # Rolling buffer of recent hip Y positions (flipped coords)
 jump_cooldown    = 0             # Counts down after a jump fires to prevent re-triggering
 
-# ── SPAM MODE / BOW STATE ─────────────────────────────────────────────────────
+# ── HOLD MODE / BOW STATE ─────────────────────────────────────────────────────
 hold_mode_active       = False   # False = tap mode (one press per gesture confirm)
-                                 # True  = spam mode (repeated presses while pose is held)
-spam_key               = None    # The key currently being spammed, or None if idle
-last_spam_time         = 0.0     # time.time() of the last spam press — used to pace the rate
+                                 # True  = hold mode (key held down while pose is held)
+spam_key               = None    # The key currently being held/spammed, or None if idle
+last_spam_time         = 0.0     # time.time() of last tap-repeat press (TAP_REPEAT_KEYS only)
 spam_debounce_counter  = 0       # Counts consecutive frames with no detected gesture.
-                                 # Only clears spam_key once this hits SPAM_DEBOUNCE_FRAMES,
-                                 # so a single wobbly frame doesn't interrupt the spam.
+                                 # Only releases the key once this hits SPAM_DEBOUNCE_FRAMES,
+                                 # so a single wobbly frame doesn't interrupt a held key.
 torso_height_history   = []      # Rolling buffer of shoulder-to-hip distances for bow detection
 bow_cooldown           = 0       # Counts down after a bow fires to prevent re-triggering
 
@@ -403,7 +408,7 @@ def check_gesture_confirmation(detected_gesture):
     return None
 
 
-# ── OUTPUT ────────────────────────────────────────────────────────────────────
+# ── KEY PRESS / HOLD / RELEASE HELPERS ───────────────────────────────────────
 
 def _resolve_key(key, caps_active):
     """Return the (keyboard_arg, display_string) pair for a key + caps state."""
@@ -412,15 +417,31 @@ def _resolve_key(key, caps_active):
     return key, key
 
 
+def _press_key(kb_key, send_keypress):
+    """Hold a key down (keyboard.press). Used for movement / sustained input."""
+    if send_keypress:
+        import keyboard
+        keyboard.press(kb_key)
+
+
+def _release_key(kb_key, send_keypress):
+    """Release a previously held key (keyboard.release)."""
+    if send_keypress:
+        import keyboard
+        keyboard.release(kb_key)
+
+
 def fire_keypress(kb_key, send_keypress):
     """
     Send a single press_and_release for kb_key.
-    Used by both tap mode (once on confirm) and spam mode (called repeatedly).
+    Used by tap mode and for keys listed in TAP_REPEAT_KEYS in hold mode.
     """
     if send_keypress:
         import keyboard
         keyboard.press_and_release(kb_key)
 
+
+# ── OUTPUT ────────────────────────────────────────────────────────────────────
 
 def output_gesture(key, frame, send_keypress, log_file, caps_active, hold_mode):
     """
@@ -429,17 +450,18 @@ def output_gesture(key, frame, send_keypress, log_file, caps_active, hold_mode):
     TAP MODE  (hold_mode=False):
         Fire a single press_and_release right now. Done.
 
-    SPAM MODE (hold_mode=True):
-        Don't press anything here. Instead, store the key in spam_key so the
-        main loop can fire it repeatedly at SPAM_RATE times per second.
-        The main loop stops spamming when the pose is lost (spam_key → None).
+    HOLD MODE (hold_mode=True):
+        For keys in TAP_REPEAT_KEYS  → store in spam_key for rapid tap-repeat.
+        For all other keys (w/a/s/d, space, etc.) → call keyboard.press() to
+        physically hold the key down. The main loop calls keyboard.release()
+        once the pose is lost. This is what Minecraft needs for smooth movement.
     """
     global spam_key, last_spam_time
     from datetime import datetime
 
     kb_key, display_key = _resolve_key(key, caps_active)
     timestamp = datetime.now().strftime("%H:%M:%S")
-    mode_tag  = "[SPAM]" if hold_mode else "[TAP] "
+    mode_tag  = "[HOLD]" if hold_mode else "[TAP] "
     print(f"[{timestamp}] ✓ {mode_tag} OUTPUT: '{display_key}'")
 
     if log_file is not None:
@@ -447,13 +469,27 @@ def output_gesture(key, frame, send_keypress, log_file, caps_active, hold_mode):
         log_file.flush()
 
     if hold_mode:
-        # Register the key for spam — the main loop ticker will fire it.
-        # If the key has changed (e.g. new gesture while already spamming),
-        # update spam_key so the new key starts immediately on the next tick.
-        if spam_key != kb_key:
-            print(f"  → Spam key set to '{kb_key}'")
-            spam_key       = kb_key
-            last_spam_time = 0.0   # Fire immediately on the very next tick
+        if kb_key in TAP_REPEAT_KEYS:
+            # Tap-repeat mode for special keys: store and let the spam ticker fire
+            if spam_key != kb_key:
+                # Release any previously held key before switching
+                if spam_key is not None:
+                    _release_key(spam_key, send_keypress)
+                    print(f"  → Released '{spam_key}' (switching to tap-repeat '{kb_key}')")
+                spam_key       = kb_key
+                last_spam_time = 0.0   # Fire immediately on the very next tick
+                print(f"  → Tap-repeat key set to '{kb_key}'")
+        else:
+            # True hold: physically press the key down and keep it held.
+            # If the key has changed, release the old one first.
+            if spam_key != kb_key:
+                if spam_key is not None:
+                    _release_key(spam_key, send_keypress)
+                    print(f"  → Released '{spam_key}'")
+                spam_key = kb_key
+                _press_key(kb_key, send_keypress)
+                print(f"  → Holding '{kb_key}' down")
+            # If it's the same key already held, do nothing — it's already down.
     else:
         # Tap mode: one clean press_and_release, nothing stored
         fire_keypress(kb_key, send_keypress)
@@ -461,6 +497,25 @@ def output_gesture(key, frame, send_keypress, log_file, caps_active, hold_mode):
             # Display-only: draw the key on the frame as visual feedback
             cv2.putText(frame, display_key, (50, 100),
                         cv2.FONT_HERSHEY_SIMPLEX, 3, (0, 0, 255), 5)
+
+
+def release_held_key(send_keypress):
+    """
+    Release whatever key is currently held (spam_key) and clear state.
+    Called when the pose is lost in hold mode, or when switching back to tap mode.
+    """
+    global spam_key, spam_debounce_counter, last_confirmed_gesture
+    if spam_key is not None:
+        if spam_key not in TAP_REPEAT_KEYS:
+            # Only truly held keys need an explicit release
+            _release_key(spam_key, send_keypress)
+            print(f"  ✋ Released held key '{spam_key}'")
+        else:
+            print(f"  ✋ Stopped tap-repeat of '{spam_key}'")
+        spam_key = None
+    spam_debounce_counter  = 0
+    # Reset so the same gesture can re-trigger immediately after re-posing
+    last_confirmed_gesture = None
 
 
 # ── DRAWING ───────────────────────────────────────────────────────────────────
@@ -496,7 +551,7 @@ def draw_hud(image, detected_gesture, l_ang, r_ang,
     if detected_gesture:
         display = detected_gesture.upper() if (caps_active and len(detected_gesture) == 1
                                                and detected_gesture.isalpha()) else detected_gesture
-        # Yellow-orange tint when actively spamming, normal green otherwise
+        # Yellow-orange tint when actively holding/spamming, normal green otherwise
         letter_color = (0, 220, 255) if (hold_mode and spam_key_name) else (0, 255, 0)
         cv2.putText(image, f"Letter: {display}", (30, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 2, letter_color, 3)
@@ -528,14 +583,17 @@ def draw_hud(image, detected_gesture, l_ang, r_ang,
         cv2.rectangle(image, (0, banner_y), (w, banner_y + banner_h), (0, 80, 180), 3)
         _draw_banner_text(image, "CAPS LOCK ON", banner_y, banner_h, w)
 
-    # ── Spam/Hold mode banner — only shown when hold_mode is active ───────────
+    # ── Hold mode banner — only shown when hold_mode is active ───────────────
     if hold_mode:
         banner_y -= banner_h
         if spam_key_name:
-            # Actively spamming — bright green to signal the key is firing
+            is_tap_repeat = spam_key_name in TAP_REPEAT_KEYS
+            label = f"HOLD MODE  —  tapping '{spam_key_name}'" if is_tap_repeat \
+                    else f"HOLD MODE  —  holding '{spam_key_name}'"
+            # Bright green = actively holding/tapping
             cv2.rectangle(image, (0, banner_y), (w, banner_y + banner_h), (0, 170, 60), -1)
             cv2.rectangle(image, (0, banner_y), (w, banner_y + banner_h), (0, 90, 30), 3)
-            _draw_banner_text(image, f"HOLD MODE ON  —  '{spam_key_name}'", banner_y, banner_h, w)
+            _draw_banner_text(image, label, banner_y, banner_h, w)
         else:
             # In hold mode but no pose confirmed yet — purple idle
             cv2.rectangle(image, (0, banner_y), (w, banner_y + banner_h), (140, 40, 140), -1)
@@ -624,7 +682,6 @@ def main():
                         from datetime import datetime
                         log_file.write(f"[{datetime.now().strftime('%H:%M:%S')}] [CAPS LOCK {state_label}]\n")
                         log_file.flush()
-                    # Caps handled via shift+key; do NOT send a real caps lock keypress.
 
                 # ── Bow → Hold/Tap mode toggle ─────────────────────────────
                 if detect_bow(body):
@@ -635,10 +692,9 @@ def main():
                         from datetime import datetime
                         log_file.write(f"[{datetime.now().strftime('%H:%M:%S')}] [MODE: {mode_label}]\n")
                         log_file.flush()
-                    # When switching back to tap mode, stop any active spam immediately
+                    # When switching back to tap mode, release any held key immediately
                     if not hold_mode_active:
-                        spam_key              = None
-                        spam_debounce_counter = 0
+                        release_held_key(args.type)
 
                 # ── Arm semaphore detection ────────────────────────────────
                 armL = (body[11], body[13], body[15])
@@ -670,65 +726,51 @@ def main():
                               f"L_pointing={l_pointing}, R_pointing={r_pointing}")
 
             # ─────────────────────────────────────────────────────────────────
-            # SPAM MODE LOGIC
+            # HOLD MODE LOGIC
             # ─────────────────────────────────────────────────────────────────
             # This block runs every frame and has two jobs:
             #
-            # JOB 1 — Decide whether to keep spamming or stop.
+            # JOB 1 — Decide whether to keep holding or stop.
             #   When a gesture is detected we reset the debounce counter so
-            #   the spam keeps going. When the gesture disappears we increment
+            #   the hold keeps going. When the gesture disappears we increment
             #   the counter. Only once it hits SPAM_DEBOUNCE_FRAMES do we
-            #   actually clear spam_key and stop. This stops a single wobbly
+            #   actually release the key and stop. This stops a single wobbly
             #   camera frame from interrupting a sustained hold pose.
             #
-            # JOB 2 — Fire the key at the right rate.
-            #   We compare the current time against last_spam_time. If enough
-            #   time has passed (1 / SPAM_RATE seconds) we fire a single
-            #   press_and_release and update last_spam_time. This is entirely
-            #   independent of the camera framerate — it will fire at exactly
-            #   SPAM_RATE times per second regardless of whether we're running
-            #   at 30fps or 60fps.
+            # JOB 2 — For TAP_REPEAT_KEYS only: fire the key at SPAM_RATE/s.
+            #   Regular held keys (w/a/s/d etc.) are already physically held
+            #   down by output_gesture — no per-frame action needed for them.
             # ─────────────────────────────────────────────────────────────────
 
             confirmed = check_gesture_confirmation(detected_gesture)
 
             if hold_mode_active:
 
-                # ── JOB 1: Update spam_key based on whether gesture is present ─
-
+                # ── JOB 1: Release key if pose has been absent long enough ───
                 if detected_gesture is not None:
-                    # Gesture is visible this frame — reset the debounce counter
-                    # so we don't accidentally stop spamming during a brief wobble
+                    # Pose visible this frame — reset debounce so hold continues
                     spam_debounce_counter = 0
                 else:
-                    # No gesture detected this frame — count up toward the stop threshold
                     spam_debounce_counter += 1
                     if spam_debounce_counter >= SPAM_DEBOUNCE_FRAMES:
-                        # Pose has been gone long enough — genuinely lost, stop spam
+                        # Pose truly gone — release the key
                         if spam_key is not None:
-                            print(f"[{frame_count}] ✋ Pose gone — stopping spam of '{spam_key}'")
-                            spam_key = None
+                            release_held_key(args.type)
                         spam_debounce_counter = 0
-                        # Reset so the same gesture can trigger spam again immediately
-                        last_confirmed_gesture = None
 
-                # ── JOB 2: Fire the key at SPAM_RATE times per second ─────────
-
-                if spam_key is not None:
+                # ── JOB 2: Tap-repeat for TAP_REPEAT_KEYS ────────────────────
+                if spam_key is not None and spam_key in TAP_REPEAT_KEYS:
                     now           = time.time()
-                    spam_interval = 1.0 / SPAM_RATE   # e.g. 0.1 s between presses at 10/s
+                    spam_interval = 1.0 / SPAM_RATE
 
                     if now - last_spam_time >= spam_interval:
-                        # Enough time has elapsed — fire a press_and_release
                         fire_keypress(spam_key, args.type)
                         last_spam_time = now
-                        # Only print occasionally to avoid flooding the console
                         if args.type:
-                            print(f"  💥 Spam: '{spam_key}'")
+                            print(f"  💥 Tap-repeat: '{spam_key}'")
 
             else:
-                # ── TAP MODE: normal single-press on confirmation ──────────────
-                # Nothing extra to do here; output_gesture handles the press.
+                # ── TAP MODE: nothing extra — output_gesture handles the press.
                 pass
 
             if confirmed:
@@ -743,6 +785,10 @@ def main():
             cv2.imshow('Semaphore', frame)
             if cv2.waitKey(1) & 0xFF == 27:   # ESC to quit
                 break
+
+    # ── Cleanup: make sure no key is left physically held ─────────────────────
+    if spam_key is not None:
+        release_held_key(args.type)
 
     cap.release()
     cv2.destroyAllWindows()
