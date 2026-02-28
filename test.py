@@ -542,23 +542,22 @@ def release_held_key(send_keypress):
 
 def send_to_minecraft(landmarks, gesture, is_holding, is_caps):
     """
-    Formats 13 specific landmarks + gesture state into JSON and sends via UDP.
+    Formats 17 specific landmarks + gesture state into JSON and sends via UDP.
     """
-    # 1. Map MediaPipe indices to the 13 nodes expected by your Java mod
-    # MediaPipe Indices: 0=nose, 2=L_eye, 5=R_eye, 7=L_ear, 8=R_ear,
-    # 11=L_shoud, 12=R_shoud, 13=L_elb, 14=R_elb, 15=L_wrist, 16=R_wrist, 23=L_hip, 24=R_hip
-    target_indices = [0, 2, 5, 7, 8, 11, 12, 13, 14, 15, 16, 23, 24]
+    # 1. Map MediaPipe indices to the 17 nodes (Nose, Eyes, Ears, Shoulders, Elbows, Wrists, Hips, Knees, Ankles)
+    target_indices = [0, 2, 5, 7, 8, 11, 12,
+                      13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
 
     nodes = []
     for idx in target_indices:
         lm = landmarks[idx]
-        # Convert normalized (0-1) to "Camera Pixels" to match mock_server style
+        # Use 1920x1080 scaling to match the mock server format
         nodes.append([lm.x * 1920, lm.y * 1080])
 
     # 2. Build the full payload
     payload = {
         "nodes": nodes,
-        "gesture": str(gesture) if gesture else "None",
+        "key": str(gesture) if gesture else "None",
         "holding": bool(is_holding),
         "caps": bool(is_caps)
     }
@@ -729,14 +728,6 @@ def main():
             l_ang = r_ang = snapped_l = snapped_r = None
 
             if result.pose_landmarks:
-                send_to_minecraft(
-                    result.pose_landmarks[0],
-                    detected_gesture,
-                    hold_mode_active,
-                    caps_lock_active
-                )
-
-                draw_skeleton(frame, result.pose_landmarks[0])
 
                 body = [
                     {'x': 1 - lm.x, 'y': 1 - lm.y, 'visibility': lm.visibility}
@@ -800,6 +791,14 @@ def main():
                         print(f"[{frame_count}] Arms visible but not straight — "
                               f"L_pointing={l_pointing}, R_pointing={r_pointing}")
 
+                send_to_minecraft(
+                    result.pose_landmarks[0],
+                    detected_gesture,
+                    hold_mode_active,
+                    caps_lock_active
+                )
+
+                draw_skeleton(frame, result.pose_landmarks[0])
             # ─────────────────────────────────────────────────────────────────
             # HOLD MODE LOGIC
             # ─────────────────────────────────────────────────────────────────
