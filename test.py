@@ -103,10 +103,10 @@ from scipy.spatial import distance as dist
 from math import atan2, degrees
 
 # ── TUNING THRESHOLDS ─────────────────────────────────────────────────────────
-VISIBILITY_THRESHOLD = 0.5   # Min landmark confidence to be considered visible
+VISIBILITY_THRESHOLD = 0.35   # Min landmark confidence to be considered visible
 # Max degrees of bend for a "straight" arm (degrees)
-STRAIGHT_LIMB_MARGIN = 20
-EXTENDED_LIMB_MARGIN = 0.8   # Forearm must be >= this fraction of upper-arm length
+STRAIGHT_LIMB_MARGIN = 35
+EXTENDED_LIMB_MARGIN = 0.65   # Forearm must be >= this fraction of upper-arm length
 # Max per-arm angular error for semaphore snapping (degrees)
 SNAP_TOLERANCE = 15
 # Consecutive frames required to confirm a gesture
@@ -157,31 +157,26 @@ POSE_CONNECTIONS = [
 
 # ── SEMAPHORE LOOKUP TABLE ────────────────────────────────────────────────────
 # Keys are (left_arm_angle, right_arm_angle) in degrees, snapped to 45° grid.
-# 'a' = alphabetic output, 'n' = numeric/symbol output (when number-shift active).
+# Restricted list: ONLY matches to the closest of these 8 characters.
 SEMAPHORES = {
     # MOVEMENT
-    (-45, 225): {'a': "w"},
-    (45,   135): {'a': "s"},
-    (0, 135): {'a': "a"},
-    (45,  180): {'a': "d"},
+    (45, 135): {'a': "w"},
+    (-45,   225): {'a': "s"},
+    (-45,    135): {'a': "a"},
+    (45,   225): {'a': "d"},
 
     # ACTIONS
-    (0, 180): {'a': "e"},
-    (135,   0): {'a': "q"},
+    #(0,    180): {'a': "e"},
+    #(135,    0): {'a': "q"},
 
-    # MENU
-    (90,  180): {'a': "escape"},
+    # MENU / OTHER
+    #(90,   180): {'a': "escape"},
+    #(90,    90): {'a': "space"},    # Space: Both arms straight down
 }
 
 # ── GESTURE CONFIRMATION STATE ────────────────────────────────────────────────
 gesture_buffer = []    # Rolling list of detected gesture labels
 last_confirmed_gesture = None  # Prevents the same gesture firing twice in a row
-
-# ── CAPS LOCK / JUMP STATE ────────────────────────────────────────────────────
-caps_lock_active = False         # Whether caps lock is currently on
-# Rolling buffer of recent hip Y positions (flipped coords)
-hip_y_history = []
-jump_cooldown = 0             # Counts down after a jump fires to prevent re-triggering
 
 # ── HOLD MODE / BOW STATE ─────────────────────────────────────────────────────
 hold_mode_active = False   # False = tap mode (one press per gesture confirm)
@@ -195,6 +190,10 @@ spam_debounce_counter = 0
 # Rolling buffer of shoulder-to-hip distances for bow detection
 torso_height_history = []
 bow_cooldown = 0       # Counts down after a bow fires to prevent re-triggering
+
+# ── JUMP DETECTION STATE ──────────────────────────────────────────────────────
+hip_y_history = []            # Rolling buffer of recent hip Y positions (flipped coords)
+jump_cooldown = 0             # Counts down after a jump fires to prevent re-triggering
 
 MC_IP = "127.0.0.1"
 MC_PORT = 5005
@@ -351,16 +350,9 @@ def detect_bow(body):
 def snap_to_nearest_semaphore(detected_l_ang, detected_r_ang, tolerance=None):
     """
     Find the closest entry in SEMAPHORES to (detected_l_ang, detected_r_ang).
-
-    Uses SNAP_TOLERANCE (or the override passed in) as the maximum allowed
-    error *per arm* — i.e. total distance budget is tolerance * 2.
-
-    Returns (snapped_l_ang, snapped_r_ang, semaphore_dict)
-         or (None, None, None) if nothing is close enough.
+    This version ignores SNAP_TOLERANCE and will ALWAYS "round" to the closest 
+    matching character from our restricted dictionary.
     """
-    if tolerance is None:
-        tolerance = SNAP_TOLERANCE
-
     best_match = None
     best_distance = float('inf')
 
@@ -372,7 +364,8 @@ def snap_to_nearest_semaphore(detected_l_ang, detected_r_ang, tolerance=None):
                      360 - abs(detected_r_ang - r_ang))
         total = l_diff + r_diff
 
-        if total < best_distance and total <= tolerance * 2:
+        # Unconditionally accept it if it's the closest one we've checked so far
+        if total < best_distance:
             best_distance = total
             best_match = (l_ang, r_ang)
 
@@ -416,8 +409,6 @@ def check_gesture_confirmation(detected_gesture):
 
 def _resolve_key(key, caps_active):
     """Return the (keyboard_arg, display_string) pair for a key + caps state."""
-    if caps_active and len(key) == 1 and key.isalpha():
-        return f"shift+{key}", key.upper()
     return key, key
 
 
@@ -447,7 +438,7 @@ def fire_keypress(kb_key, send_keypress):
 
 # ── OUTPUT ────────────────────────────────────────────────────────────────────
 
-def output_gesture(key, frame, send_keypress, log_file, caps_active, hold_mode):
+def output_gesture(key, frame, send_keypress, log_file, hold_mode):
     """
     Handle a newly confirmed gesture.
 
@@ -463,7 +454,7 @@ def output_gesture(key, frame, send_keypress, log_file, caps_active, hold_mode):
     global spam_key, last_spam_time
     from datetime import datetime
 
-    kb_key, display_key = _resolve_key(key, caps_active)
+    kb_key, display_key = _resolve_key(key, False)
     timestamp = datetime.now().strftime("%H:%M:%S")
     mode_tag = "[HOLD]" if hold_mode else "[TAP] "
     print(f"[{timestamp}] ✓ {mode_tag} OUTPUT: '{display_key}'")
@@ -523,7 +514,7 @@ def release_held_key(send_keypress):
     last_confirmed_gesture = None
 
 
-def send_to_minecraft(landmarks, gesture, is_holding, is_caps):
+def send_to_minecraft(landmarks, gesture, is_holding):
     """
     Formats 17 specific landmarks + gesture state into JSON and sends via UDP.
     """
@@ -542,7 +533,6 @@ def send_to_minecraft(landmarks, gesture, is_holding, is_caps):
         "nodes": nodes,
         "key": str(gesture) if gesture else "None",
         "holding": bool(is_holding),
-        "caps": bool(is_caps)
     }
 
     # 3. Ship it
@@ -573,7 +563,7 @@ def draw_skeleton(image, pose_landmarks):
 
 def draw_hud(image, detected_gesture, l_ang, r_ang,
              snapped_l, snapped_r, buffer_count, confirmed,
-             caps_active, hold_mode, spam_key_name):
+             hold_mode, spam_key_name):
     """Overlay gesture detection info on the camera frame."""
     h, w, _ = image.shape
 
@@ -583,8 +573,7 @@ def draw_hud(image, detected_gesture, l_ang, r_ang,
 
     y = 50
     if detected_gesture:
-        display = detected_gesture.upper() if (caps_active and len(detected_gesture) == 1
-                                               and detected_gesture.isalpha()) else detected_gesture
+        display = detected_gesture
         # Yellow-orange tint when actively holding/spamming, normal green otherwise
         letter_color = (0, 220, 255) if (
             hold_mode and spam_key_name) else (0, 255, 0)
@@ -611,15 +600,6 @@ def draw_hud(image, detected_gesture, l_ang, r_ang,
     # ── Banners stack upward from the bottom ──────────────────────────────────
     banner_h = 65
     banner_y = h
-
-    # ── Caps Lock banner ──────────────────────────────────────────────────────
-    if caps_active:
-        banner_y -= banner_h
-        cv2.rectangle(image, (0, banner_y),
-                      (w, banner_y + banner_h), (0, 130, 255), -1)
-        cv2.rectangle(image, (0, banner_y),
-                      (w, banner_y + banner_h), (0, 80, 180), 3)
-        _draw_banner_text(image, "CAPS LOCK ON", banner_y, banner_h, w)
 
     # ── Hold mode banner — only shown when hold_mode is active ───────────────
     if hold_mode:
@@ -661,7 +641,7 @@ def _draw_banner_text(image, label, banner_y, banner_h, w):
 
 def main():
     global gesture_buffer, last_confirmed_gesture
-    global caps_lock_active, hip_y_history, jump_cooldown
+    global hold_mode_active, hip_y_history, jump_cooldown
     global hold_mode_active, spam_key, last_spam_time, spam_debounce_counter
     global torso_height_history, bow_cooldown
 
@@ -717,17 +697,6 @@ def main():
                     for lm in result.pose_landmarks[0]
                 ]
 
-                # ── Jump → Caps Lock ───────────────────────────────────────
-                if detect_jump(body):
-                    caps_lock_active = not caps_lock_active
-                    state_label = "ON" if caps_lock_active else "OFF"
-                    print(f"[{frame_count}] 🔼 JUMP — CAPS LOCK {state_label}")
-                    if log_file:
-                        from datetime import datetime
-                        log_file.write(
-                            f"[{datetime.now().strftime('%H:%M:%S')}] [CAPS LOCK {state_label}]\n")
-                        log_file.flush()
-
                 # ── Bow → Hold/Tap mode toggle ─────────────────────────────
                 if detect_bow(body):
                     hold_mode_active = not hold_mode_active
@@ -777,8 +746,7 @@ def main():
                 send_to_minecraft(
                     result.pose_landmarks[0],
                     detected_gesture,
-                    hold_mode_active,
-                    caps_lock_active
+                    hold_mode_active
                 )
 
                 draw_skeleton(frame, result.pose_landmarks[0])
@@ -832,12 +800,12 @@ def main():
 
             if confirmed:
                 output_gesture(confirmed, frame, args.type, log_file,
-                               caps_lock_active, hold_mode_active)
+                               hold_mode_active)
 
             draw_hud(frame, detected_gesture,
                      l_ang, r_ang, snapped_l, snapped_r,
                      len(gesture_buffer), bool(confirmed),
-                     caps_lock_active, hold_mode_active, spam_key)
+                     hold_mode_active, spam_key)
 
             cv2.imshow('Semaphore', frame)
             if cv2.waitKey(1) & 0xFF == 27:   # ESC to quit
