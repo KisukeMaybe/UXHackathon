@@ -713,6 +713,16 @@ def main():
                     if not hold_mode_active:
                         release_held_key(args.type)
 
+                # ── Jump → Capslock keypress ───────────────────────────────
+                if detect_jump(body):
+                    print(f"[{frame_count}] ⬆️  JUMP — sending CAPSLOCK")
+                    fire_keypress('capslock', args.type)
+                    if log_file:
+                        from datetime import datetime
+                        log_file.write(
+                            f"[{datetime.now().strftime('%H:%M:%S')}] [JUMP: CAPSLOCK]\n")
+                        log_file.flush()
+
                 # ── Arm semaphore detection ────────────────────────────────
                 armL = (body[11], body[13], body[15])
                 armR = (body[12], body[14], body[16])
